@@ -547,7 +547,16 @@ class DecisionCoordinator:
                 rules_result = controller.handle({"op": "get_rules"})
                 if not rules_result.get("ok"):
                     return
-                planning_input = {"rules": rules_result["rules"], "state": state}
+                # 物理引擎只枚举合法落底及其客观结果，不评分、不排序、不推荐。
+                # LLM 负责对完整候选集进行战略比较并提出自己的 shortlist。
+                landings_result = controller.handle({"op": "legal_landings"})
+                if not landings_result.get("ok"):
+                    return
+                planning_input = {
+                    "rules": rules_result["rules"],
+                    "state": state,
+                    "legal_landings": landings_result["landings"],
+                }
             with self.lock:
                 self.pending_identity = identity
                 self.decision_started_at = time.perf_counter()
@@ -580,6 +589,7 @@ class DecisionCoordinator:
                     planning_input["rules"],
                     planning_input["state"],
                     MAX_LLM_CANDIDATES,
+                    planning_input["legal_landings"],
                 )
                 with self.lock:
                     if generation != self.generation:

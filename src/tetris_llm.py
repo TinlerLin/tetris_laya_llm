@@ -1,8 +1,8 @@
 """第三方 LLM 规划模块。
 
-本模块只接收游戏规则与原始状态，不依赖合法落点枚举、启发式评分或
-Expectimax。LLM 必须自行提出多个旋转/位置策略并指定自己的最终选择，
-之后由游戏规则层校验；启用 Laya 时，该选择可再交由 Laya 复核。
+本模块接收游戏规则、原始状态，以及物理引擎枚举的全部合法落底结果。
+这些结果不包含评分、排序、推荐或启发式选择；LLM 负责战略比较、生成
+候选短名单并指定自己的最终选择，启用 Laya 时再交由 Laya 复核。
 """
 
 import json
@@ -114,23 +114,64 @@ class ThirdPartyLLM:
         return parse_json_object(str(content))
 
 
-def plan_strategies(client, rules, state, count=4):
-    """让 LLM 仅根据原始规则和状态自行规划多个策略。"""
+def plan_strategies(client, rules, state, count=4, legal_landings=None):
+    """让 LLM 比较物理引擎枚举的客观落底结果并规划多个策略。"""
     current = state["current_piece"]
     next_piece = state["next_piece"]
+    legal_landings = list(legal_landings or [])
+    if len(legal_landings) < count:
+        raise RuntimeError(
+            f"游戏引擎仅提供 {len(legal_landings)} 个合法落底，无法生成 {count} 个策略"
+        )
+
+    landing_map = {item["id"]: item for item in legal_landings}
+
+    def compact_board(board):
+        rows = board.splitlines()
+        top_y = next((index for index, row in enumerate(rows) if "#" in row), len(rows))
+        return {"top_y": top_y, "rows": rows[top_y:]}
+
+    objective_outcomes = []
+    for item in legal_landings:
+        metrics = item["metrics"]
+        objective_outcomes.append({
+            "landing_id": item["id"],
+            "rotation_cw": item["rotation_cw"],
+            "target_x": item["target_x"],
+            "final_y": item["final_y"],
+            "cleared_lines": metrics["lines"],
+            "holes": metrics["holes"],
+            "holes_by_column": metrics["holes_by_column"],
+            "column_heights": metrics["heights"],
+            "max_height": metrics["max_height"],
+            "aggregate_height": metrics["aggregate_height"],
+            "bumpiness": metrics["bumpiness"],
+            "board_after": compact_board(item["board_after"]),
+        })
+
     system_prompt = (
-        "You are the sole strategic planner for a real-time Tetris game. No heuristic "
-        "planner or precomputed landing list is available. Derive placements yourself from "
-        "the supplied rules, board, current piece and next piece. Produce distinct strategies "
-        "that balance survival, holes, height, surface shape and line clears. rotation_cw is "
-        "an integer from 0 to 3. target_x is the zero-based board column of the rotated "
-        "shape's left edge. Rank the strategies strongest-first and make your own binding "
-        "final choice using final_choice (a 1-based strategy index). The chosen strategy "
-        "will be hard-dropped unless optional Laya review is enabled. Return JSON only."
+        "You are the sole STRATEGIC planner for a real-time 10x20 Tetris game. The game physics "
+        "engine has enumerated every legal current-piece landing and simulated its immediate "
+        "result. This list is objective only: it has no score, rank, recommendation, pruning, "
+        "or heuristic choice. Never invent a landing and never redo collision geometry; choose "
+        "only by landing_id from the supplied list.\n\n"
+        "Compare all outcomes, not merely the first few. Use this strict priority: (1) avoid "
+        "top-out and dangerous height; (2) minimize holes, especially newly covered or deep "
+        "holes; (3) keep aggregate/max height low; (4) keep a reasonably flat, accessible "
+        "surface without deep wells or overhangs; (5) use the known NEXT piece as one-piece "
+        "lookahead by judging whether it has a safe useful placement on board_after; (6) prefer "
+        "line clears when they do not violate the earlier priorities. Never create a hole only "
+        "to gain an immediate clear. Treat lower holes, max_height, aggregate_height, and "
+        "bumpiness as better unless the board_after and next piece justify a specific exception.\n\n"
+        "Return exactly the requested number of distinct landing_ids, strongest first. "
+        "final_choice is the 1-based index of the strongest returned strategy and should normally "
+        "be 1 after correct ranking. Keep each reason short and factual: cite relevant numeric "
+        "outcome metrics and the NEXT-piece outlook. Do not expose chain-of-thought. Respond "
+        "immediately with one JSON object only; no Markdown or surrounding prose."
     )
     example = {
         "strategies": [
-            {"rotation_cw": 0, "target_x": 3, "reason": "short factual rationale"}
+            {"landing_id": "R0_X3", "reason": "short factual rationale"}
         ],
         "final_choice": 1,
         "summary": "brief overall plan",
@@ -138,13 +179,19 @@ def plan_strategies(client, rules, state, count=4):
     user_prompt = (
         f"Rules:\n{json.dumps(rules, ensure_ascii=False)}\n\n"
         f"Round identity: round={state['round_serial']}, piece={state['piece_serial']}\n"
-        f"Current piece: name={current['name']}, shape={current['shape']}, "
-        f"x={current['x']}, y={current['y']}\n"
-        f"Next piece: name={next_piece['name']}, shape={next_piece['shape']}\n"
-        f"Milliseconds until automatic fall: {state['ms_until_auto_fall']}\n"
-        f"Board without active piece, top to bottom:\n{state['board']}\n\n"
-        f"Return exactly {count} distinct strategies and your binding final_choice in this schema:\n"
-        f"{json.dumps(example, ensure_ascii=False)}"
+        f"Current piece: {current['name']} at x={current['x']}, y={current['y']}\n"
+        f"Known next piece for lookahead: {next_piece['name']}, shape={next_piece['shape']}\n"
+        f"Time until the next gravity step: {state['ms_until_auto_fall']} ms. Planning does "
+        "not pause gravity, so answer concisely.\n\n"
+        "Objective legal outcomes follow. board_after.top_y is the first non-empty y row after "
+        "locking and clearing; board_after.rows contains every 10-cell row from top_y through "
+        "y=19, so all omitted rows above top_y are empty. '#' is occupied and '.' is empty. "
+        "All metrics describe board_after. Smaller hole/height/bumpiness values are generally "
+        "safer. Evaluate the entire JSON array:\n"
+        f"{json.dumps(objective_outcomes, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        f"Return exactly {count} distinct strategies and your binding final_choice. The single "
+        "strategy below illustrates field names only; your strategies array must still contain "
+        f"exactly {count} objects:\n{json.dumps(example, ensure_ascii=False)}"
     )
     result = client.chat_json(system_prompt, user_prompt)
     raw_strategies = result.get("strategies")
@@ -163,21 +210,21 @@ def plan_strategies(client, rules, state, count=4):
     for index, raw in enumerate(raw_strategies, start=1):
         if not isinstance(raw, dict):
             raise RuntimeError(f"LLM 策略 #{index} 不是 object")
-        try:
-            rotation = int(raw["rotation_cw"])
-            target_x = int(raw["target_x"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(f"LLM 策略 #{index} 缺少合法 rotation_cw/target_x") from exc
-        if rotation < 0 or rotation > 3:
-            raise RuntimeError(f"LLM 策略 #{index} rotation_cw 必须处于 0..3")
-        key = (rotation, target_x)
-        if key in seen:
-            raise RuntimeError(f"LLM 返回重复策略: rotation={rotation}, x={target_x}")
-        seen.add(key)
+        landing_id = str(raw.get("landing_id", "")).strip()
+        if landing_id not in landing_map:
+            raise RuntimeError(f"LLM 策略 #{index} 返回未知 landing_id={landing_id!r}")
+        if landing_id in seen:
+            raise RuntimeError(f"LLM 返回重复策略: landing_id={landing_id}")
+        seen.add(landing_id)
+        landing = landing_map[landing_id]
         strategies.append({
             "id": f"S{index}",
-            "rotation_cw": rotation,
-            "target_x": target_x,
+            "landing_id": landing_id,
+            "rotation_cw": landing["rotation_cw"],
+            "target_x": landing["target_x"],
+            # 将物理引擎计算的客观结果继续传给可选 Laya 复核，避免
+            # Laya 再从 ASCII 棋盘中自行估算空洞和高度。
+            "objective_metrics": dict(landing["metrics"]),
             "reason": str(raw.get("reason", "")).strip(),
             "llm_rank": index,
             "llm_final_choice": index == final_choice,

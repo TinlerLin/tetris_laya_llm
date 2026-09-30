@@ -27,11 +27,16 @@ def review_llm_strategies(agent, rules, state, strategies):
     criteria = {}
     for label, strategy in option_map.items():
         validated = strategy["validation"]
+        metrics = strategy.get("objective_metrics", {})
         criteria[label] = (
             f"LLM_rank={strategy['llm_rank']}; strategy={strategy['id']}; "
+            f"LLM_final_choice={bool(strategy.get('llm_final_choice'))}; "
             f"rotation_cw={strategy['rotation_cw']}; target_x={strategy['target_x']}; "
             f"final_y={validated['final_y']}; cleared_lines={validated['cleared_lines']}; "
-            f"LLM_reason={strategy['reason']}; resulting_board={validated['board_after']}"
+            f"holes={metrics.get('holes')}; holes_by_column={metrics.get('holes_by_column')}; "
+            f"column_heights={metrics.get('heights')}; max_height={metrics.get('max_height')}; "
+            f"aggregate_height={metrics.get('aggregate_height')}; "
+            f"bumpiness={metrics.get('bumpiness')}; LLM_reason={strategy['reason']}"
         )
     current = state["current_piece"]
     state_text = (
@@ -43,10 +48,15 @@ def review_llm_strategies(agent, rules, state, strategies):
         "select_plan": {
             "type": "choice",
             "instructions": (
-                "Make the binding final choice among the LLM-planned, rule-valid strategies. "
-                "Prefer survival, fewer inaccessible holes, safe height, useful line clears "
-                "and a board compatible with the next piece. Choose exactly one option; do "
-                "not invent or modify a strategy."
+                "Conservatively verify the binding final choice among four rule-valid strategies "
+                "shortlisted from the complete legal landing set. The option marked "
+                "LLM_final_choice=True is the planner baseline: keep it unless another option "
+                "has clear objective evidence of lower risk. Fewer holes dominates immediate "
+                "line clears; then prefer safer max/aggregate height, accessible column profile, "
+                "lower bumpiness, and compatibility with the known next piece. Do not replace "
+                "the baseline merely to be different, and never choose extra holes just for a "
+                "clear unless required to avoid imminent top-out. Choose exactly one option; "
+                "do not invent or modify a strategy."
             ),
             "criteria": criteria,
         }
