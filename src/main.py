@@ -130,28 +130,63 @@ def _decode_clipboard_data(raw):
 
 
 def clipboard_text():
-    """读取单行文本；优先使用 Pygame，失败时回退到系统 Tk 剪贴板。"""
-    try:
-        pasted = _decode_clipboard_data(pygame.scrap.get(pygame.SCRAP_TEXT))
-        if pasted:
-            return pasted.replace("\r", "").replace("\n", "").replace("\t", "").strip()
-    except (pygame.error, TypeError):
-        pass
+    """读取文本并保留换行；优先读取系统剪贴板，Pygame 仅作回退。"""
     root = None
     try:
         import tkinter
         root = tkinter.Tk()
         root.withdraw()
+        root.update()
         pasted = root.clipboard_get()
-        return str(pasted).replace("\r", "").replace("\n", "").replace("\t", "").strip()
+        if pasted:
+            return str(pasted).replace("\r\n", "\n").replace("\r", "\n").strip()
     except Exception:
-        return ""
+        pass
+    finally:
+        if root is not None:
+            root.destroy()
+    try:
+        pasted = _decode_clipboard_data(pygame.scrap.get(pygame.SCRAP_TEXT))
+        if pasted:
+            return pasted.replace("\r\n", "\n").replace("\r", "\n").strip()
+    except (pygame.error, TypeError):
+        pass
+    return ""
+
+
+def set_clipboard_text(value):
+    """将文本写入系统剪贴板；优先使用 Tk，失败时回退到 Pygame。"""
+    value = str(value)
+    if not value:
+        return False
+    root = None
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(value)
+        # update() 让 Windows 在窗口销毁后仍保留剪贴板所有权。
+        root.update()
+        return True
+    except Exception:
+        try:
+            pygame.scrap.put(pygame.SCRAP_TEXT, value.encode("utf-8"))
+            return True
+        except (pygame.error, TypeError):
+            return False
     finally:
         if root is not None:
             root.destroy()
 
 
 class InputField:
+    REPEATABLE_KEYS = {
+        pygame.K_BACKSPACE, pygame.K_DELETE, pygame.K_LEFT, pygame.K_RIGHT,
+    }
+    REPEAT_DELAY_SECONDS = 0.36
+    REPEAT_INTERVAL_SECONDS = 0.045
+
     def __init__(self, name, label, value="", secret=False):
         self.name = name
         self.label = label
@@ -159,11 +194,121 @@ class InputField:
         self.secret = secret
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.active = False
+        self.cursor = len(value)
+        self.selection_anchor = self.cursor
+        self.dragging = False
+        self.view_start = 0
+        self.view_end = len(value)
+        self.repeat_key = None
+        self.repeat_mod = 0
+        self.next_repeat_at = None
 
     def display_value(self):
         if self.secret and self.value:
-            return "•" * min(len(self.value), 32)
+            # 保持显示字符数与真实值索引一一对应，才能正确定位光标和选区；
+            # 超出输入框的部分由横向视口裁切。
+            return "•" * len(self.value)
         return self.value
+
+    def selection_bounds(self):
+        return tuple(sorted((self.cursor, self.selection_anchor)))
+
+    def has_selection(self):
+        start, end = self.selection_bounds()
+        return start != end
+
+    def set_value(self, value):
+        self.value = str(value)
+        self.cursor = len(self.value)
+        self.selection_anchor = self.cursor
+        self.view_start = 0
+
+    def replace_selection(self, text):
+        start, end = self.selection_bounds()
+        self.value = self.value[:start] + text + self.value[end:]
+        self.cursor = start + len(text)
+        self.selection_anchor = self.cursor
+
+    def copy_selection(self, cut=False):
+        if not self.has_selection():
+            return False
+        start, end = self.selection_bounds()
+        if not set_clipboard_text(self.value[start:end]):
+            return False
+        if cut:
+            self.replace_selection("")
+        return True
+
+    def _set_cursor(self, position, extend=False):
+        position = max(0, min(len(self.value), int(position)))
+        if not extend:
+            self.selection_anchor = position
+        self.cursor = position
+
+    def _index_at_x(self, mouse_x):
+        shown = self.display_value()
+        if mouse_x <= self.rect.x + 9:
+            return self.view_start
+        if mouse_x >= self.rect.right - 9:
+            return self.view_end
+        relative_x = mouse_x - (self.rect.x + 9)
+        visible = shown[self.view_start:self.view_end]
+        previous_width = 0
+        for offset in range(1, len(visible) + 1):
+            width = font(15).size(visible[:offset])[0]
+            if relative_x < (previous_width + width) / 2:
+                return self.view_start + offset - 1
+            previous_width = width
+        return self.view_end
+
+    def begin_mouse_selection(self, mouse_x, extend=False):
+        position = self._index_at_x(mouse_x)
+        self._set_cursor(position, extend=extend)
+        self.dragging = True
+
+    def drag_selection(self, mouse_x):
+        if not self.dragging:
+            return
+        if mouse_x <= self.rect.x:
+            position = 0
+        elif mouse_x >= self.rect.right:
+            position = len(self.value)
+        else:
+            position = self._index_at_x(mouse_x)
+        self._set_cursor(position, extend=True)
+
+    def end_mouse_selection(self):
+        self.dragging = False
+
+    def begin_key_repeat(self, event, now=None):
+        if event.key not in self.REPEATABLE_KEYS:
+            return
+        now = time.perf_counter() if now is None else now
+        self.repeat_key = event.key
+        self.repeat_mod = event.mod
+        self.next_repeat_at = now + self.REPEAT_DELAY_SECONDS
+
+    def end_key_repeat(self, key=None):
+        if key is None or key == self.repeat_key:
+            self.repeat_key = None
+            self.repeat_mod = 0
+            self.next_repeat_at = None
+
+    def repeat_due(self, fields=None, now=None):
+        if self.repeat_key is None or self.next_repeat_at is None:
+            return False
+        now = time.perf_counter() if now is None else now
+        if now < self.next_repeat_at:
+            return False
+        event = pygame.event.Event(
+            pygame.KEYDOWN,
+            key=self.repeat_key,
+            mod=self.repeat_mod,
+            unicode="",
+        )
+        self.handle_key(event, fields)
+        self.next_repeat_at = now + self.REPEAT_INTERVAL_SECONDS
+        return True
 
     def draw(self, screen, label_x, box_x, y, box_w, enabled=True):
         self.rect = pygame.Rect(box_x, y, box_w, 34)
@@ -173,35 +318,110 @@ class InputField:
         pygame.draw.rect(screen, fill, self.rect, border_radius=6)
         pygame.draw.rect(screen, border, self.rect, 1, border_radius=6)
         shown = self.display_value()
-        while shown and font(15).size(shown)[0] > box_w - 18:
-            shown = shown[1:]
-        draw_text(
-            screen,
-            shown or ("可留空" if self.secret else ""),
-            box_x + 9,
-            y + 7,
-            15,
-            TEXT if shown else MUTED,
-        )
+        available = box_w - 18
+        self.cursor = min(self.cursor, len(self.value))
+        self.selection_anchor = min(self.selection_anchor, len(self.value))
+        if self.active:
+            if self.cursor < self.view_start:
+                self.view_start = self.cursor
+            while (
+                self.view_start < self.cursor
+                and font(15).size(shown[self.view_start:self.cursor])[0] > available
+            ):
+                self.view_start += 1
+        else:
+            self.view_start = 0
+            while (
+                self.view_start < len(shown)
+                and font(15).size(shown[self.view_start:])[0] > available
+            ):
+                self.view_start += 1
+        self.view_end = self.view_start
+        while self.view_end < len(shown):
+            candidate = shown[self.view_start:self.view_end + 1]
+            if font(15).size(candidate)[0] > available:
+                break
+            self.view_end += 1
+        visible = shown[self.view_start:self.view_end]
 
-    def handle_key(self, event):
-        if event.key == pygame.K_BACKSPACE:
-            self.value = self.value[:-1]
+        if self.active and self.has_selection():
+            selected_start, selected_end = self.selection_bounds()
+            selected_start = max(selected_start, self.view_start)
+            selected_end = min(selected_end, self.view_end)
+            if selected_start < selected_end:
+                left = font(15).size(shown[self.view_start:selected_start])[0]
+                width = font(15).size(shown[selected_start:selected_end])[0]
+                pygame.draw.rect(
+                    screen, (45, 91, 120),
+                    pygame.Rect(box_x + 9 + left, y + 5, max(1, width), 24),
+                    border_radius=2,
+                )
+
+        draw_text(screen, visible or ("可留空" if self.secret else ""),
+                  box_x + 9, y + 7, 15, TEXT if visible else MUTED)
+        if self.active and self.view_start <= self.cursor <= self.view_end:
+            caret_x = box_x + 9 + font(15).size(
+                shown[self.view_start:self.cursor]
+            )[0]
+            pygame.draw.line(screen, TEXT, (caret_x, y + 6), (caret_x, y + 28), 1)
+
+    def handle_key(self, event, fields=None):
+        ctrl = bool(event.mod & pygame.KMOD_CTRL)
+        shift = bool(event.mod & pygame.KMOD_SHIFT)
+        if ctrl and event.key == pygame.K_a:
+            self.selection_anchor = 0
+            self.cursor = len(self.value)
+        elif ctrl and event.key == pygame.K_c:
+            self.copy_selection()
+        elif ctrl and event.key == pygame.K_x:
+            self.copy_selection(cut=True)
+        elif event.key == pygame.K_LEFT:
+            if self.has_selection() and not shift:
+                self._set_cursor(self.selection_bounds()[0])
+            else:
+                self._set_cursor(self.cursor - 1, extend=shift)
+        elif event.key == pygame.K_RIGHT:
+            if self.has_selection() and not shift:
+                self._set_cursor(self.selection_bounds()[1])
+            else:
+                self._set_cursor(self.cursor + 1, extend=shift)
+        elif event.key == pygame.K_HOME:
+            self._set_cursor(0, extend=shift)
+        elif event.key == pygame.K_END:
+            self._set_cursor(len(self.value), extend=shift)
+        elif event.key == pygame.K_BACKSPACE:
+            if self.has_selection():
+                self.replace_selection("")
+            elif self.cursor > 0:
+                self.selection_anchor = self.cursor - 1
+                self.replace_selection("")
         elif event.key == pygame.K_DELETE:
-            self.value = ""
+            if self.has_selection():
+                self.replace_selection("")
+            elif self.cursor < len(self.value):
+                self.selection_anchor = self.cursor + 1
+                self.replace_selection("")
         elif (
             event.key == pygame.K_v and event.mod & pygame.KMOD_CTRL
         ) or (
             event.key == pygame.K_INSERT and event.mod & pygame.KMOD_SHIFT
         ):
-            self.paste()
-        elif event.unicode and event.unicode.isprintable() and not event.mod & pygame.KMOD_CTRL:
-            self.value += event.unicode
+            self.paste(fields)
+        elif event.unicode and event.unicode.isprintable() and not ctrl:
+            self.replace_selection(event.unicode)
 
-    def paste(self):
-        pasted = clipboard_text()
+    def paste(self, fields=None, pasted=None):
+        pasted = clipboard_text() if pasted is None else str(pasted)
         if pasted:
-            self.value += pasted
+            normalized = pasted.replace("\r\n", "\n").replace("\r", "\n").strip()
+            lines = [line.strip() for line in normalized.split("\n")]
+            if fields is not None and len(fields) >= 3 and len(lines) == 3:
+                # 三行配置块无论粘贴到哪个输入框，都按固定顺序覆盖填充。
+                for field, value in zip(fields[:3], lines):
+                    field.set_value(value)
+                return True
+            # 非三行内容维持原来的单输入框行为，去除换行和制表符。
+            self.replace_selection(normalized.replace("\n", "").replace("\t", ""))
             return True
         return False
 
@@ -213,6 +433,7 @@ class DecisionCoordinator:
         self.laya_status = "未加载"
         self.laya_error = ""
         self.pending_identity = None
+        self.decision_started_at = None
         self.processed_identity = None
         self.generation = 0
         self.phase = "等待开始"
@@ -224,6 +445,8 @@ class DecisionCoordinator:
         self.execute_ms = 0.0
         self.llm_calls = 0
         self.laya_calls = 0
+        self.discarded_decisions = 0
+        self.last_discarded_identity = None
 
     def ensure_laya_loading(self):
         """仅在用户启用可选复核时加载 Laya。"""
@@ -248,6 +471,11 @@ class DecisionCoordinator:
 
     def snapshot(self):
         with self.lock:
+            planning_elapsed_ms = (
+                (time.perf_counter() - self.decision_started_at) * 1000
+                if self.pending_identity is not None and self.decision_started_at is not None
+                else 0.0
+            )
             return {
                 "laya_status": self.laya_status,
                 "laya_error": self.laya_error,
@@ -260,7 +488,10 @@ class DecisionCoordinator:
                 "execute_ms": self.execute_ms,
                 "llm_calls": self.llm_calls,
                 "laya_calls": self.laya_calls,
+                "discarded_decisions": self.discarded_decisions,
+                "last_discarded_identity": self.last_discarded_identity,
                 "pending": self.pending_identity is not None,
+                "planning_elapsed_ms": planning_elapsed_ms,
             }
 
     def reset_round(self, mode="llm"):
@@ -268,24 +499,26 @@ class DecisionCoordinator:
             # 使上一回合尚未返回的 LLM/Laya 后台任务失效。
             self.generation += 1
             self.pending_identity = None
+            self.decision_started_at = None
             self.processed_identity = None
             self.phase = "玩家控制中" if mode == "player" else "等待首个方块"
             self.last_error = ""
             self.last_summary = ""
             self.last_decision = "尚无决策"
+            self.discarded_decisions = 0
+            self.last_discarded_identity = None
 
     def end_round(self):
         with self.lock:
             self.generation += 1
             self.pending_identity = None
+            self.decision_started_at = None
             self.processed_identity = None
             self.phase = "回合已手动结束"
 
     def maybe_start(self, controller, config):
         with self.lock:
-            if (
-                config.get("use_laya") and self.laya_agent is None
-            ) or self.pending_identity is not None:
+            if config.get("use_laya") and self.laya_agent is None:
                 return
         with controller.lock:
             state = controller.snapshot()
@@ -293,7 +526,18 @@ class DecisionCoordinator:
                 return
             identity = (state["round_serial"], state["piece_serial"])
             with self.lock:
-                if identity == self.processed_identity or identity == self.pending_identity:
+                if self.pending_identity is not None:
+                    if identity == self.pending_identity:
+                        return
+                    # 当前方块已经变化：使旧后台任务失效，并立即允许新方块规划。
+                    # 旧 HTTP/Laya 调用可能仍在其守护线程中返回，但 generation
+                    # 校验保证它不能复核、执行或覆盖新任务状态。
+                    self.last_discarded_identity = self.pending_identity
+                    self.discarded_decisions += 1
+                    self.generation += 1
+                    self.pending_identity = None
+                    self.decision_started_at = None
+                if identity == self.processed_identity:
                     return
             if config.get("mode") == "heuristic":
                 planning_input = controller.handle({"op": "legal_landings"})
@@ -306,6 +550,7 @@ class DecisionCoordinator:
                 planning_input = {"rules": rules_result["rules"], "state": state}
             with self.lock:
                 self.pending_identity = identity
+                self.decision_started_at = time.perf_counter()
                 self.phase = (
                     "Expectimax 启发式规划中"
                     if config.get("mode") == "heuristic" else "第三方 LLM 规划中"
@@ -336,6 +581,9 @@ class DecisionCoordinator:
                     planning_input["state"],
                     MAX_LLM_CANDIDATES,
                 )
+                with self.lock:
+                    if generation != self.generation:
+                        return
                 validated = []
                 validated_outcomes = set()
                 invalid = []
@@ -435,6 +683,8 @@ class DecisionCoordinator:
             result = controller.handle(request)
             execute_ms = (time.perf_counter() - execute_started) * 1000
             with self.lock:
+                if generation != self.generation:
+                    return
                 self.laya_ms = laya_ms
                 self.execute_ms = execute_ms
                 if config.get("use_laya"):
@@ -460,6 +710,7 @@ class DecisionCoordinator:
                 if generation == self.generation:
                     self.processed_identity = identity
                     self.pending_identity = None
+                    self.decision_started_at = None
 
 
 LINE_CLEAR_ANIMATION_SECONDS = 0.26
@@ -686,6 +937,8 @@ def draw_dashboard(
         for field in fields:
             field.rect.update(0, 0, 0, 0)
             field.active = False
+            field.end_mouse_selection()
+            field.end_key_repeat()
         if planner_mode == "heuristic":
             draw_text(screen, "无需第三方 API 配置", config_rect.x + 104, 140, 18, SUCCESS, True)
             draw_text(screen, "当前块 + 已知下一块 + 七袋概率下的下下块",
@@ -757,15 +1010,29 @@ def draw_dashboard(
         draw_text(screen, shorten(info["phase"], 38), decision_rect.x + 170, decision_rect.y + 42,
                   15, ACCENT, True)
         planner_label = "LLM" if planner_mode == "llm" else "Expectimax"
-        timing = f"{planner_label} {info['llm_ms']:.0f} ms"
+        planner_ms = (
+            info["planning_elapsed_ms"] if info["pending"] else info["llm_ms"]
+        )
+        timing = f"{planner_label} {planner_ms:.0f} ms"
         if use_laya:
             timing += f" · Laya {info['laya_ms']:.0f} ms"
         timing += f" · 执行 {info['execute_ms']:.1f} ms"
+        if info["discarded_decisions"]:
+            timing += f" · 丢弃旧请求 {info['discarded_decisions']}"
         draw_text(screen, timing,
                   decision_rect.x + 16, decision_rect.y + 76, 14, MUTED)
         draw_text(screen, shorten(info["last_decision"], 62), decision_rect.x + 16,
                   decision_rect.y + 108, 15, TEXT, True)
-        waiting_message = "等待第三方 LLM 规划" if planner_mode == "llm" else "等待 Expectimax 规划"
+        if info["pending"]:
+            waiting_message = (
+                f"正在等待 {planner_label} 响应 · "
+                f"{info['planning_elapsed_ms'] / 1000:.1f}s"
+            )
+        else:
+            waiting_message = (
+                "等待第三方 LLM 规划"
+                if planner_mode == "llm" else "等待 Expectimax 规划"
+            )
         laya_error = info["laya_error"] if use_laya else ""
         message = info["last_error"] or laya_error or info["last_summary"] or waiting_message
         draw_text(screen, shorten(message, 70), decision_rect.x + 16, decision_rect.y + 140,
@@ -880,6 +1147,21 @@ def run(host, port, fall_ms):
                 if event.type == pygame.WINDOWFOCUSLOST:
                     # 防止切出窗口时漏掉 KEYUP，造成方向键持续移动。
                     player_keys.clear()
+                    for field in fields:
+                        field.end_mouse_selection()
+                        field.end_key_repeat()
+                    continue
+                if event.type == pygame.MOUSEMOTION:
+                    if (
+                        active_index is not None
+                        and planner_mode == "llm"
+                        and not controller.snapshot()["round_active"]
+                    ):
+                        fields[active_index].drag_selection(event.pos[0])
+                    continue
+                if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    for field in fields:
+                        field.end_mouse_selection()
                     continue
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                     state = controller.snapshot()
@@ -888,9 +1170,12 @@ def run(host, port, fall_ms):
                             if field.rect.collidepoint(event.pos):
                                 for other in fields:
                                     other.active = False
+                                    other.end_key_repeat()
                                 field.active = True
                                 active_index = index
-                                field.paste()
+                                field.begin_mouse_selection(event.pos[0])
+                                field.end_mouse_selection()
+                                field.paste(fields)
                                 break
                     continue
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -918,6 +1203,12 @@ def run(host, port, fall_ms):
                             )
                             if field.active:
                                 active_index = index
+                                field.begin_mouse_selection(
+                                    event.pos[0],
+                                    extend=bool(pygame.key.get_mods() & pygame.KMOD_SHIFT),
+                                )
+                            else:
+                                field.end_key_repeat()
                         if start_rect.collidepoint(event.pos):
                             info = coordinator.snapshot()
                             ready, _ = start_readiness(
@@ -933,6 +1224,7 @@ def run(host, port, fall_ms):
                                     player_keys.clear()
                                     for field in fields:
                                         field.active = False
+                                        field.end_key_repeat()
                                     active_index = None
                                 except Exception as exc:
                                     with coordinator.lock:
@@ -943,8 +1235,11 @@ def run(host, port, fall_ms):
                         coordinator.end_round()
                         player_keys.clear()
                     continue
-                if event.type == pygame.KEYUP and planner_mode == "player":
-                    player_keys.release(event.key)
+                if event.type == pygame.KEYUP:
+                    if active_index is not None:
+                        fields[active_index].end_key_repeat(event.key)
+                    if planner_mode == "player":
+                        player_keys.release(event.key)
                     continue
                 if event.type == pygame.KEYDOWN:
                     state = controller.snapshot()
@@ -954,7 +1249,8 @@ def run(host, port, fall_ms):
                             active_index = (active_index + 1) % len(fields)
                             fields[active_index].active = True
                         elif event.key != pygame.K_RETURN:
-                            fields[active_index].handle_key(event)
+                            fields[active_index].handle_key(event, fields)
+                            fields[active_index].begin_key_repeat(event)
                     elif state["round_active"]:
                         action = keyboard_action(planner_mode, event.key)
                         should_apply = True
@@ -966,6 +1262,12 @@ def run(host, port, fall_ms):
                             controller.handle({"op": "action", "action": action})
 
             state = controller.snapshot()
+            if (
+                active_index is not None
+                and planner_mode == "llm"
+                and not state["round_active"]
+            ):
+                fields[active_index].repeat_due(fields)
             if planner_mode == "player" and state["round_active"]:
                 for action in player_keys.due_actions(state["fall_ms"]):
                     controller.handle({"op": "action", "action": action})

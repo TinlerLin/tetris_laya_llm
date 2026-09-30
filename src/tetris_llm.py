@@ -6,6 +6,7 @@ Expectimax。LLM 必须自行提出多个旋转/位置策略并指定自己的�
 """
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -17,23 +18,37 @@ def parse_json_object(text):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     try:
-        return json.loads(text)
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            raise RuntimeError(f"LLM 未返回 JSON object: {text[:250]}")
-        return json.loads(text[start : end + 1])
+        pass
+
+    # 兼容推理或说明文字包围 JSON 的响应。逐个左花括号尝试解码，
+    # 避免把前置推理中的花括号与最终 JSON 粗暴拼接到一起。
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    preview = text[:250] if text else "<empty content>"
+    raise RuntimeError(f"LLM 未返回可解析的 JSON object: {preview}")
 
 
 class ThirdPartyLLM:
     """最小 OpenAI-compatible Chat Completions 客户端。"""
 
-    def __init__(self, base_url, api_key, model, timeout=45):
+    def __init__(self, base_url, api_key, model, timeout=45, max_tokens=None):
         self.base_url = base_url.strip().rstrip("/")
         self.api_key = api_key.strip()
         self.model = model.strip()
         self.timeout = float(timeout)
+        self.max_tokens = int(
+            max_tokens or os.getenv("THIRD_PARTY_LLM_MAX_TOKENS", "4096")
+        )
 
     @property
     def endpoint(self):
@@ -49,8 +64,17 @@ class ThirdPartyLLM:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 700,
+            "max_tokens": self.max_tokens,
         }
+        # DeepSeek 的 JSON Output 需要显式指定 response_format；提示词本身
+        # 已多次明确要求返回 JSON，符合其 JSON 模式要求。
+        if "deepseek" in self.base_url.lower() or "deepseek" in self.model.lower():
+            payload["response_format"] = {"type": "json_object"}
+            # deepseek-flash 当前默认启用 high 级别思考；俄罗斯方块规划是
+            # 实时短任务，显式关闭思考可避免请求长期停留在推理阶段。
+            payload["thinking"] = {"type": "disabled"}
+            payload["reasoning_effort"] = "none"
+        payload["stream"] = False
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -69,13 +93,23 @@ class ThirdPartyLLM:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"LLM 连接失败: {exc.reason}") from exc
         try:
-            content = raw["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
+            choice = raw["choices"][0]
+            message = choice["message"]
+            content = message.get("content")
+        except (AttributeError, KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"LLM 响应不兼容 Chat Completions: {str(raw)[:350]}") from exc
         if isinstance(content, list):
             content = "".join(
                 str(item.get("text", "")) if isinstance(item, dict) else str(item)
                 for item in content
+            )
+        if content is None or not str(content).strip():
+            finish_reason = choice.get("finish_reason", "unknown")
+            reasoning = message.get("reasoning_content") or ""
+            raise RuntimeError(
+                "LLM 返回的 content 为空"
+                f"（finish_reason={finish_reason}, reasoning_chars={len(str(reasoning))}）。"
+                "请提高 THIRD_PARTY_LLM_MAX_TOKENS，或关闭模型的深度思考模式。"
             )
         return parse_json_object(str(content))
 

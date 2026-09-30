@@ -193,6 +193,20 @@ python src/main.py --host 127.0.0.1 --port 8765 --fall-ms 600
 - `Ctrl+V`
 - `Shift+Insert`
 - 输入框内右键粘贴
+- 鼠标点击定位光标，按住左键拖动选择文本
+- `←` / `→`、`Home` / `End` 移动光标，配合 `Shift` 扩展选区，`Ctrl+A` 全选
+- 长按 `Backspace` 连续向前删除；`Delete`、`←`、`→` 同样支持长按
+- `Ctrl+C` 复制选区，`Ctrl+X` 剪切选区，`Ctrl+V` 替换选区或在光标处粘贴
+- Windows 下优先读取系统剪贴板，确保外部程序刚复制的内容可以立即粘贴
+- 在任意输入框粘贴三行文本时，自动按“Base URL、模型、API Key”的顺序覆盖填充三个输入框
+
+例如复制以下三行，并在任意一个配置输入框中粘贴：
+
+```text
+https://api.deepseek.com
+deepseek-flash
+your-api-key
+```
 
 决策流程：
 
@@ -343,9 +357,12 @@ $env:THIRD_PARTY_LLM_BASE_URL = "http://127.0.0.1:1234/v1"
 $env:THIRD_PARTY_LLM_MODEL = "your-model-name"
 $env:THIRD_PARTY_LLM_API_KEY = ""
 $env:THIRD_PARTY_LLM_TIMEOUT = "45"
+$env:THIRD_PARTY_LLM_MAX_TOKENS = "4096"
 $env:TETRIS_PLANNER_MODE = "llm"
 python src/main.py
 ```
+
+`THIRD_PARTY_LLM_MAX_TOKENS` 控制规划响应的最大输出量，默认 `4096`。DeepSeek 可直接使用类似 `https://api.deepseek.com` 的 Base URL；程序会为 DeepSeek 自动启用 JSON Output，并关闭默认的高强度思考模式以满足实时决策要求。若其他兼容服务仍提示 `content` 为空，可继续提高该值，或在服务端关闭深度思考。
 
 `TETRIS_PLANNER_MODE` 支持：
 
@@ -446,6 +463,7 @@ python src/laya_json_service.py --loop
 - AI 规划期间游戏不会暂停。
 - 每个策略都绑定 `round_serial` 和 `piece_serial`。
 - 方块已经落地或回合已经变化时，旧策略会被拒绝。
+- 若规划尚未返回而当前方块已经落底，旧任务立即作废并为新方块启动规划；旧响应稍后返回也不会进入 Laya 或执行阶段。
 - 迟到策略不会作用到下一方块。
 - 游戏窗口被关闭后，本地控制服务会一并停止。
 - LLM 规划失败时，当前方块继续自然下落。
