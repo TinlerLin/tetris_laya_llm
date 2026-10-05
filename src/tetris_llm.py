@@ -140,6 +140,7 @@ def plan_strategies(client, rules, state, count=4, legal_landings=None):
             "target_x": item["target_x"],
             "final_y": item["final_y"],
             "cleared_lines": metrics["lines"],
+            "score_delta": metrics["score_delta"],
             "holes": metrics["holes"],
             "holes_by_column": metrics["holes_by_column"],
             "column_heights": metrics["heights"],
@@ -152,17 +153,20 @@ def plan_strategies(client, rules, state, count=4, legal_landings=None):
     system_prompt = (
         "You are the sole STRATEGIC planner for a real-time 10x20 Tetris game. The game physics "
         "engine has enumerated every legal current-piece landing and simulated its immediate "
-        "result. This list is objective only: it has no score, rank, recommendation, pruning, "
-        "or heuristic choice. Never invent a landing and never redo collision geometry; choose "
+        "result. This list has no rank, recommendation, pruning, or heuristic choice; it gives "
+        "objective outcomes and the engine-calculated immediate score_delta. Never invent a "
+        "landing and never redo collision geometry; choose "
         "only by landing_id from the supplied list.\n\n"
-        "Compare all outcomes, not merely the first few. Use this strict priority: (1) avoid "
-        "top-out and dangerous height; (2) minimize holes, especially newly covered or deep "
-        "holes; (3) keep aggregate/max height low; (4) keep a reasonably flat, accessible "
-        "surface without deep wells or overhangs; (5) use the known NEXT piece as one-piece "
-        "lookahead by judging whether it has a safe useful placement on board_after; (6) prefer "
-        "line clears when they do not violate the earlier priorities. Never create a hole only "
-        "to gain an immediate clear. Treat lower holes, max_height, aggregate_height, and "
-        "bumpiness as better unless the board_after and next piece justify a specific exception.\n\n"
+        "Compare all outcomes, not merely the first few. Use this priority: (1) avoid top-out, "
+        "dangerous height, and newly buried or deep holes; never accept materially higher "
+        "survival risk just for points; (2) among outcomes with comparable safety, prefer the "
+        "higher immediate score_delta. The scoring rule is 0/100/300/500/800 points for clearing "
+        "0/1/2/3/4 lines in one placement, so multiple-line clears have greater value; (3) when "
+        "score is equal, prefer lower aggregate/max height and a flat, accessible surface "
+        "without deep wells or overhangs; (4) use the known NEXT piece as one-piece lookahead "
+        "and prefer a board_after that gives it a safe useful placement. Never create a hole "
+        "only to gain an immediate clear. Treat lower holes, max_height, aggregate_height, and "
+        "bumpiness as safer unless the board_after and next piece justify a specific exception.\n\n"
         "Return exactly the requested number of distinct landing_ids, strongest first. "
         "final_choice is the 1-based index of the strongest returned strategy and should normally "
         "be 1 after correct ranking. Keep each reason short and factual: cite relevant numeric "
@@ -184,7 +188,8 @@ def plan_strategies(client, rules, state, count=4, legal_landings=None):
         f"Time until the next gravity step: {state['ms_until_auto_fall']} ms. Planning does "
         "not pause gravity, so answer concisely.\n\n"
         "Objective legal outcomes follow. board_after.top_y is the first non-empty y row after "
-        "locking and clearing; board_after.rows contains every 10-cell row from top_y through "
+        "locking and clearing; score_delta is the immediate score awarded for this placement; "
+        "board_after.rows contains every 10-cell row from top_y through "
         "y=19, so all omitted rows above top_y are empty. '#' is occupied and '.' is empty. "
         "All metrics describe board_after. Smaller hole/height/bumpiness values are generally "
         "safer. Evaluate the entire JSON array:\n"

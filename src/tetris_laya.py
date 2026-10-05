@@ -34,6 +34,7 @@ def review_llm_strategies(agent, rules, state, strategies):
             f"LLM_final_choice={bool(strategy.get('llm_final_choice'))}; "
             f"rotation_cw={strategy['rotation_cw']}; target_x={strategy['target_x']}; "
             f"final_y={validated['final_y']}; cleared_lines={validated['cleared_lines']}; "
+            f"score_delta={metrics.get('score_delta', 0)}; "
             f"holes={metrics.get('holes')}; holes_by_column={metrics.get('holes_by_column')}; "
             f"column_heights={metrics.get('heights')}; max_height={metrics.get('max_height')}; "
             f"aggregate_height={metrics.get('aggregate_height')}; "
@@ -52,12 +53,14 @@ def review_llm_strategies(agent, rules, state, strategies):
                 "Conservatively verify the binding final choice among four rule-valid strategies "
                 "shortlisted from the complete legal landing set. The option marked "
                 "LLM_final_choice=True is the planner baseline: keep it unless another option "
-                "has clear objective evidence of lower risk. Fewer holes dominates immediate "
-                "line clears; then prefer safer max/aggregate height, accessible column profile, "
-                "lower bumpiness, and compatibility with the known next piece. Do not replace "
-                "the baseline merely to be different, and never choose extra holes just for a "
-                "clear unless required to avoid imminent top-out. Choose exactly one option; "
-                "do not invent or modify a strategy."
+                "has clear objective evidence of lower survival risk or meaningfully higher "
+                "score_delta with comparable safety. score_delta is 0/100/300/500/800 for "
+                "clearing 0/1/2/3/4 lines in one placement. Safety comes first: do not accept "
+                "top-out, materially higher danger, or newly buried/deep holes just for points. "
+                "Among comparably safe choices, prefer more points; then prefer lower "
+                "aggregate/max height, an accessible column profile, lower bumpiness, and "
+                "compatibility with the known next piece. Do not replace the baseline merely to "
+                "be different. Choose exactly one option; do not invent or modify a strategy."
             ),
             "criteria": criteria,
         }
@@ -88,11 +91,23 @@ def review_heuristic_candidates(agent, legal, candidates):
             height_text = "堆叠变高"
         else:
             height_text = "堆叠保持低位"
-        statement = f"这个落点{line_text}，{holes_text}，{height_text}。"
+        score_delta = metrics.get("score_delta", 0)
+        statement = (
+            f"这个落点{line_text}，本次得分 +{score_delta} 分，"
+            f"{holes_text}，{height_text}。"
+        )
         started = time.perf_counter()
         result = agent.predict(
             statement,
-            {"q": {"type": "noul", "instructions": "这是一个好的落点吗？"}},
+            {
+                "q": {
+                    "type": "noul",
+                    "instructions": (
+                        "这是一个好的落点吗？先避免危险高度和新埋空洞；安全性相近时，"
+                        "本次得分更高的落点更好。不要为了高分接受明显更高的死亡风险。"
+                    ),
+                }
+            },
         )
         inference_ms += (time.perf_counter() - started) * 1000.0
         try:

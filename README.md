@@ -17,7 +17,7 @@
 - 10×20 俄罗斯方块棋盘与七袋随机系统
 - 方块自动下落，并随游戏时间逐步加速
 - 左右移动和旋转不重置、不推迟自动下落计时
-- 分数、消行数、落块数和运行时间统计
+- 分数、消行数、落块数和运行时间统计；单次消除 1/2/3/4 行分别得 100/300/500/800 分
 - 消行高亮与轻量粒子效果
 - 本地 TCP JSONL 游戏控制服务
 - 决策回合与方块编号校验
@@ -131,7 +131,7 @@ python -m pip install --upgrade pygame
 python -m pip install --upgrade laya
 ```
 
-Laya 官方的基础安装命令是 `pip install laya`。基础包已经满足本项目需求，不必额外安装 `laya[serve]`、`laya[mcp]` 等可选组件。安装 `laya` 时会同时解析 `torch`、`transformers`、`huggingface_hub`、`safetensors` 和 `numpy` 等依赖。若不使用 Laya，LLM、启发式程序和玩家自主模式均不需要加载 Laya 模型。
+英文版和多语言版使用相同的 Python 包，因此都执行上面的 `python -m pip install --upgrade laya`；不需要为多语言模型安装另一个包或 extra。这个命令安装 Laya 运行库及其依赖，具体使用哪个模型 checkpoint 则在启动游戏时通过 `LAYA_MODEL` 选择（见下方“指定模型 ID 或本地模型目录”）。基础包已经满足本项目需求，不必额外安装 `laya[serve]`、`laya[mcp]` 等可选组件。安装 `laya` 时会同时解析 `torch`、`transformers`、`huggingface_hub`、`safetensors` 和 `numpy` 等依赖。若不使用 Laya，LLM、启发式程序和玩家自主模式均不需要加载 Laya 模型。
 
 如果需要使用 NVIDIA GPU，请先根据本机 CUDA 环境安装匹配的 PyTorch，再安装 `laya` 和 `pygame`。仅用于体验本项目时，CPU 版本也可以运行，但 Laya 推理速度会更慢。
 
@@ -255,22 +255,29 @@ LLM 模式不会调用启发式规划器，也不会获得启发式评分或程�
 
 Laya 是可选复核模块。只有勾选面板中的 **使用 Laya 复核（可选）** 时，程序才会按需加载模型；未勾选时不会等待或调用 Laya。
 
-默认模型：
+可选择英文版或多语言版模型：
 
-```text
-convaiinnovations/laya
-```
+| 选择 | Hugging Face 模型 ID | 说明 |
+|---|---|---|
+| 英文版（默认） | `convaiinnovations/laya` | Laya 英文根模型 |
+| 多语言版 | `convaiinnovations/laya-multilingual` | 支持中文等多种语言；本项目的游戏状态和 Laya 复核问题使用中文时，可选此模型 |
 
-模型主页：<https://huggingface.co/convaiinnovations/laya>
+模型主页：[英文版](https://huggingface.co/convaiinnovations/laya) · [多语言版](https://huggingface.co/convaiinnovations/laya-multilingual)
 
 ### 在线加载并建立本地缓存
 
-首次调用时，Laya 会从 Hugging Face 下载模型并写入本地缓存。官方说明中，默认英文根模型的下载量约为 808 MB；请预留足够的磁盘空间，并保证首次运行时能够访问 Hugging Face。
+首次调用时，Laya 会从 Hugging Face 下载所选模型并写入本地缓存。官方说明中，默认英文根模型的下载量约为 808 MB；请预留足够的磁盘空间，并保证首次运行时能够访问 Hugging Face。
 
-可以先单独执行一次模型加载，完成下载和初始化验证：
+例如，预先加载英文版模型：
 
 ```bash
 python -c "import laya; agent = laya.load('convaiinnovations/laya'); print(type(agent).__name__)"
+```
+
+预先加载多语言版模型：
+
+```bash
+python -c "import laya; agent = laya.load('convaiinnovations/laya-multilingual'); print(type(agent).__name__)"
 ```
 
 此后再运行游戏时会复用缓存，无须重复下载相同文件。
@@ -295,7 +302,14 @@ python -c "import laya; laya.load('convaiinnovations/laya')"
 
 项目通过 `LAYA_MODEL` 读取模型位置。该值既可以是 Hugging Face 模型 ID，也可以是已经准备好的本地模型目录。
 
-Windows PowerShell：
+选择多语言版（Windows PowerShell）：
+
+```powershell
+$env:LAYA_MODEL = "convaiinnovations/laya-multilingual"
+python src/main.py
+```
+
+选择英文版（Windows PowerShell）：
 
 ```powershell
 $env:LAYA_MODEL = "convaiinnovations/laya"
@@ -309,10 +323,10 @@ $env:LAYA_MODEL = "D:\Models\laya"
 python src/main.py
 ```
 
-Linux/macOS：
+Linux/macOS 示例（多语言版）：
 
 ```bash
-export LAYA_MODEL="convaiinnovations/laya"
+export LAYA_MODEL="convaiinnovations/laya-multilingual"
 python src/main.py
 ```
 

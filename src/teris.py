@@ -42,6 +42,7 @@ SHAPES = {
     "S": [[0, 1, 1], [1, 1, 0]],
     "Z": [[1, 1, 0], [0, 1, 1]],
 }
+LINE_CLEAR_POINTS = (0, 100, 300, 500, 800)
 
 BLOCK_COLORS = [
     (80, 180, 255), (255, 100, 100), (100, 220, 120), (255, 200, 80),
@@ -67,7 +68,10 @@ def game_rules():
         "placement": (
             "target_x 是旋转后方块包围盒左边缘列；执行时保持该旋转和 x 并直接落底"
         ),
-        "line_clear": "横向 10 格全部占用时消除该行，每行计 100 分",
+        "line_clear": (
+            "横向 10 格全部占用时消行；单次消除 1/2/3/4 行分别计 "
+            "100/300/500/800 分"
+        ),
         "gravity": (
             "当前方块会自动下落，且下落间隔随游戏时间逐步缩短；"
             "左右移动和旋转不会重置、推迟或暂停自动下落计时"
@@ -215,7 +219,7 @@ class TetrisEngine:
         cleared = self.H - len(remaining)
         self.grid = [[0] * self.W for _ in range(cleared)] + remaining
         self.lines_cleared += cleared
-        self.score += cleared * 100
+        self.score += LINE_CLEAR_POINTS[cleared]
         return cleared
 
     def grid_ascii(self, include_active=False):
@@ -244,6 +248,7 @@ class TetrisEngine:
         grid = [[False] * self.W for _ in range(lines)] + [row for row in grid if not all(row)]
         metrics = self.analyze_grid(grid)
         metrics["lines"] = lines
+        metrics["score_delta"] = LINE_CLEAR_POINTS[lines]
         return y, grid, metrics
 
     def analyze_grid(self, grid):

@@ -846,6 +846,43 @@ def draw_player_guide(screen):
               14, SUCCESS, True)
 
 
+def draw_dashed_rect(screen, rect, color, dash=7, gap=5, width=2):
+    """Draw a dashed rectangular outline using short line segments."""
+    for start, end in ((rect.topleft, rect.topright), (rect.topright, rect.bottomright),
+                       (rect.bottomright, rect.bottomleft), (rect.bottomleft, rect.topleft)):
+        x1, y1 = start
+        x2, y2 = end
+        length = abs(x2 - x1) + abs(y2 - y1)
+        dx = 0 if x1 == x2 else (1 if x2 > x1 else -1)
+        dy = 0 if y1 == y2 else (1 if y2 > y1 else -1)
+        offset = 0
+        while offset < length:
+            segment = min(dash, length - offset)
+            pygame.draw.line(
+                screen, color,
+                (x1 + dx * offset, y1 + dy * offset),
+                (x1 + dx * (offset + segment), y1 + dy * (offset + segment)),
+                width,
+            )
+            offset += dash + gap
+
+
+def draw_piece_preview(screen, shape, rect, color):
+    pygame.draw.rect(screen, BOARD_BG, rect, border_radius=7)
+    pygame.draw.rect(screen, BORDER, rect, 1, border_radius=7)
+    if not shape:
+        return
+    rows, columns = len(shape), max((len(row) for row in shape), default=0)
+    cell = max(8, min(16, (rect.w - 12) // max(1, columns), (rect.h - 12) // max(1, rows)))
+    start_x = rect.centerx - columns * cell // 2
+    start_y = rect.centery - rows * cell // 2
+    for y, row in enumerate(shape):
+        for x, occupied in enumerate(row):
+            if occupied:
+                block = pygame.Rect(start_x + x * cell, start_y + y * cell, cell - 2, cell - 2)
+                pygame.draw.rect(screen, color, block, border_radius=2)
+
+
 def draw_board(screen, controller):
     game = controller.game
     pygame.draw.rect(screen, BOARD_BG, (0, 0, BOARD_W, SCREEN_H))
@@ -882,6 +919,24 @@ def draw_board(screen, controller):
             pygame.draw.rect(overlay, (224, 244, 255, alpha), row_rect, border_radius=3)
         screen.blit(overlay, (0, 0))
     elif game.piece and game.piece_color:
+        landing = game.simulate_landing(game.piece, game.px)
+        if landing is not None:
+            landing_y = landing[0]
+            ghost_color = tuple(
+                round(channel * 0.35 + 255 * 0.65)
+                for channel in game.piece_color
+            )
+            for dy, row in enumerate(game.piece):
+                for dx, occupied in enumerate(row):
+                    x, y = game.px + dx, landing_y + dy
+                    if occupied and 0 <= x < game.W and 0 <= y < game.H:
+                        rect = pygame.Rect(
+                            x * CELL_SIZE + 2,
+                            y * CELL_SIZE + 2,
+                            BLOCK_SIZE - MARGIN - 4,
+                            BLOCK_SIZE - MARGIN - 4,
+                        )
+                        draw_dashed_rect(screen, rect, ghost_color)
         for dy, row in enumerate(game.piece):
             for dx, occupied in enumerate(row):
                 x, y = game.px + dx, game.py + dy
@@ -1006,11 +1061,17 @@ def draw_dashboard(
     draw_text(screen, f"分数 {game.score}", stats_rect.x + 16, stats_rect.y + 42, 19, TEXT, True)
     draw_text(screen, f"消行 {game.lines_cleared}", stats_rect.x + 152, stats_rect.y + 42, 18, SUCCESS, True)
     draw_text(screen, f"落块 {game.pieces_locked}", stats_rect.x + 284, stats_rect.y + 42, 18, TEXT, True)
-    draw_text(screen, f"耗时 {duration(state['elapsed_seconds'])}", stats_rect.x + 416,
-              stats_rect.y + 44, 14, MUTED)
-    current, next_name = game.piece_name or "--", game.next_piece_name or "--"
-    draw_text(screen, f"Round #{state['round_serial']}  Piece #{game.piece_serial}  当前 {current}  下一块 {next_name}",
-              stats_rect.x + 16, stats_rect.y + 78, 14, MUTED)
+    draw_text(screen, f"耗时 {duration(state['elapsed_seconds'])}", stats_rect.x + 16,
+              stats_rect.y + 78, 13, MUTED)
+    current = game.piece_name or "--"
+    draw_text(screen, f"Round #{state['round_serial']}  Piece #{game.piece_serial}  当前 {current}",
+              stats_rect.x + 150, stats_rect.y + 78, 13, MUTED)
+    draw_text(screen, f"下一块 {game.next_piece_name or '--'}",
+              stats_rect.right - 112, stats_rect.y + 24, 13, ACCENT, True)
+    draw_piece_preview(
+        screen, game.next_piece,
+        pygame.Rect(stats_rect.right - 112, stats_rect.y + 46, 96, 54), ACCENT,
+    )
 
     decision_rect = pygame.Rect(PANEL_X + 10, 456, PANEL_W - 20, 176)
     if planner_mode == "player":
