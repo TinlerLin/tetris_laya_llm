@@ -2,6 +2,7 @@
 
 import os
 import re
+import time
 
 
 def load_agent(model=None):
@@ -70,37 +71,48 @@ def review_llm_strategies(agent, rules, state, strategies):
 
 
 def review_heuristic_candidates(agent, legal, candidates):
-    """启发式模式的独立复核入口；不会被 LLM 模式调用。"""
+    """Ask Laya to rate each shortlisted placement, then apply a height guard."""
     labels = tuple("ABCD"[: len(candidates)])
-    option_map = dict(zip(labels, candidates))
-    criteria = {}
-    for rank, (label, item) in enumerate(option_map.items(), start=1):
-        metrics = item["metrics"]
-        planner = item.get("planner", {})
-        criteria[label] = (
-            f"planner_rank={rank}; landing={item['id']}; "
-            f"rotation_cw={item['rotation_cw']}; x={item['target_x']}; "
-            f"lines={metrics['lines']}; holes={metrics['holes']}; "
-            f"max_height={metrics['max_height']}; bumpiness={metrics['bumpiness']}; "
-            f"expectimax_score={planner.get('score', 0):.3f}"
+    rated = []
+    inference_ms = 0.0
+    for label, candidate in zip(labels, candidates):
+        metrics = candidate["metrics"]
+        lines = metrics["lines"]
+        line_text = f"消除{('零', '一', '两', '三', '四')[lines]}行" if lines else "不消行"
+        holes = metrics.get("holes_delta", metrics.get("holes", 0))
+        holes_text = f"埋下{holes}个空洞" if holes else "不留空洞"
+        height = metrics.get("height", metrics.get("max_height", 0))
+        if height > 15:
+            height_text = "堆叠接近板顶"
+        elif height > 10:
+            height_text = "堆叠变高"
+        else:
+            height_text = "堆叠保持低位"
+        statement = f"这个落点{line_text}，{holes_text}，{height_text}。"
+        started = time.perf_counter()
+        result = agent.predict(
+            statement,
+            {"q": {"type": "noul", "instructions": "这是一个好的落点吗？"}},
         )
-    questions = {
-        "select_plan": {
-            "type": "choice",
-            "instructions": (
-                "Make the binding final choice among the heuristic shortlist. Prefer fewer "
-                "holes, safe height, smooth accessible structure and safe line clears."
-            ),
-            "criteria": criteria,
-        }
-    }
-    state_text = (
-        f"Current={legal['current_piece']['name']}; next={legal['next_piece']['name']}; "
-        f"board={legal['board']}"
-    )
-    result = agent.predict(state_text, questions)
-    answer = result["answers"]["select_plan"]
-    choice = _parse_choice(answer.get("choice"), labels)
-    if choice is None:
-        raise RuntimeError(f"Laya 返回无法解析的选择: {answer.get('choice')!r}")
-    return choice, option_map[choice], float(answer.get("answer_confidence", 0.0) or 0.0)
+        inference_ms += (time.perf_counter() - started) * 1000.0
+        try:
+            p_good = float(result["answers"]["q"]["noul"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Laya 未返回有效的 noul 评分: {result!r}") from exc
+        rated.append({"label": label, "candidate": candidate, "p_good": p_good})
+
+    proposed = max(rated, key=lambda item: item["p_good"])
+    executed = proposed
+    if proposed["candidate"]["metrics"].get("height", 0) > 15:
+        safe = [item for item in rated if item["candidate"]["metrics"].get("height", 0) <= 15]
+        if safe:
+            executed = max(safe, key=lambda item: item["p_good"])
+
+    for item in rated:
+        item["candidate"]["laya_p_good"] = item["p_good"]
+        item["candidate"]["laya_label"] = item["label"]
+    selected = executed["candidate"]
+    selected["laya_proposed"] = proposed["candidate"]["id"]
+    selected["laya_guard_intervened"] = proposed is not executed
+    selected["laya_inference_ms"] = inference_ms
+    return executed["label"], selected, executed["p_good"]

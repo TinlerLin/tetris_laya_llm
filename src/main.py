@@ -2,7 +2,7 @@
 
 统一入口组合 teris.py 游戏主体、tetris_llm.py 规划模块与
 可插拔的 tetris_laya.py 复核模块，并负责执行最终选定的策略。
-玩家可在开始前选择第三方 LLM、三层 Expectimax 启发式规划或玩家自主模式。
+玩家可在开始前选择第三方 LLM、单步启发式候选规划或玩家自主模式。
 
 从仓库根目录启动：python src/main.py
 
@@ -441,6 +441,7 @@ class DecisionCoordinator:
         self.last_summary = ""
         self.last_decision = "尚无决策"
         self.llm_ms = 0.0
+        self.heuristic_ms = 0.0
         self.laya_ms = 0.0
         self.execute_ms = 0.0
         self.llm_calls = 0
@@ -484,6 +485,7 @@ class DecisionCoordinator:
                 "last_summary": self.last_summary,
                 "last_decision": self.last_decision,
                 "llm_ms": self.llm_ms,
+                "heuristic_ms": self.heuristic_ms,
                 "laya_ms": self.laya_ms,
                 "execute_ms": self.execute_ms,
                 "llm_calls": self.llm_calls,
@@ -561,7 +563,7 @@ class DecisionCoordinator:
                 self.pending_identity = identity
                 self.decision_started_at = time.perf_counter()
                 self.phase = (
-                    "Expectimax 启发式规划中"
+                    "单步启发式候选规划中"
                     if config.get("mode") == "heuristic" else "第三方 LLM 规划中"
                 )
                 self.last_error = ""
@@ -632,13 +634,19 @@ class DecisionCoordinator:
             with self.lock:
                 if generation != self.generation:
                     return
-                self.phase = (
-                    "Laya 最终复核中"
-                    if config.get("use_laya")
-                    else "规划器自主决策完成"
-                )
-                self.llm_ms = planner_ms
-                self.llm_calls += 1
+                if config.get("use_laya"):
+                    self.phase = (
+                        "Laya 候选评分中"
+                        if config.get("mode") == "heuristic"
+                        else "Laya 最终复核中"
+                    )
+                else:
+                    self.phase = "规划器自主决策完成"
+                if config.get("mode") == "llm":
+                    self.llm_ms = planner_ms
+                    self.llm_calls += 1
+                else:
+                    self.heuristic_ms = planner_ms
                 self.last_summary = summary
 
             if config.get("use_laya"):
@@ -655,14 +663,20 @@ class DecisionCoordinator:
                         candidates,
                     )
                 laya_ms = (time.perf_counter() - laya_started) * 1000
-                decision_text = (
-                    f"Laya {choice} → {selected['id']} · conf={confidence:.3f}"
-                )
+                if config.get("mode") == "heuristic":
+                    guard_text = " · 护栏介入" if selected.get("laya_guard_intervened") else ""
+                    decision_text = (
+                        f"Laya {choice} → {selected['id']} · P={confidence:.3f}{guard_text}"
+                    )
+                else:
+                    decision_text = (
+                        f"Laya {choice} → {selected['id']} · conf={confidence:.3f}"
+                    )
             else:
                 laya_ms = 0.0
                 if config.get("mode") == "heuristic":
                     selected = candidates[0]
-                    decision_text = f"Expectimax 自主选择 → {selected['id']}"
+                    decision_text = f"启发式首选 → {selected['id']}"
                 else:
                     selected = next(
                         (item for item in candidates if item.get("llm_final_choice")),
@@ -698,7 +712,9 @@ class DecisionCoordinator:
                 self.laya_ms = laya_ms
                 self.execute_ms = execute_ms
                 if config.get("use_laya"):
-                    self.laya_calls += 1
+                    self.laya_calls += (
+                        len(candidates) if config.get("mode") == "heuristic" else 1
+                    )
                 self.last_decision = decision_text
                 if result.get("ok"):
                     self.phase = "已交互执行并落底"
@@ -951,11 +967,11 @@ def draw_dashboard(
             field.end_key_repeat()
         if planner_mode == "heuristic":
             draw_text(screen, "无需第三方 API 配置", config_rect.x + 104, 140, 18, SUCCESS, True)
-            draw_text(screen, "当前块 + 已知下一块 + 七袋概率下的下下块",
+            draw_text(screen, "单步启发式筛选最多 4 个不同落点",
                       config_rect.x + 104, 180, 15, TEXT)
             decision_hint = (
-                "生成 4 个候选，由 Laya 最终复核"
-                if use_laya else "Expectimax 评分第一名作为最终决策"
+                "Laya 逐候选评分，危险高度时启用护栏"
+                if use_laya else "启发式排名第一的候选直接执行"
             )
             draw_text(screen, decision_hint,
                       config_rect.x + 104, 218, 14, MUTED)
@@ -1019,9 +1035,9 @@ def draw_dashboard(
                   15, laya_color, True)
         draw_text(screen, shorten(info["phase"], 38), decision_rect.x + 170, decision_rect.y + 42,
                   15, ACCENT, True)
-        planner_label = "LLM" if planner_mode == "llm" else "Expectimax"
-        planner_ms = (
-            info["planning_elapsed_ms"] if info["pending"] else info["llm_ms"]
+        planner_label = "LLM" if planner_mode == "llm" else "启发式"
+        planner_ms = info["planning_elapsed_ms"] if info["pending"] else (
+            info["llm_ms"] if planner_mode == "llm" else info["heuristic_ms"]
         )
         timing = f"{planner_label} {planner_ms:.0f} ms"
         if use_laya:
@@ -1041,7 +1057,7 @@ def draw_dashboard(
         else:
             waiting_message = (
                 "等待第三方 LLM 规划"
-                if planner_mode == "llm" else "等待 Expectimax 规划"
+                if planner_mode == "llm" else "等待启发式规划"
             )
         laya_error = info["laya_error"] if use_laya else ""
         message = info["last_error"] or laya_error or info["last_summary"] or waiting_message
@@ -1113,7 +1129,7 @@ def run(host, port, fall_ms):
     except pygame.error:
         pass
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-    pygame.display.set_caption("Tetris【玩家 / LLM / Expectimax / 可选 Laya】")
+    pygame.display.set_caption("Tetris【玩家 / LLM / 启发式 / 可选 Laya】")
     clock = pygame.time.Clock()
     controller = game_api.GameController(fall_ms)
     server = game_api.ControlServer((host, port), controller)
@@ -1301,7 +1317,7 @@ def run(host, port, fall_ms):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tetris with LLM/Expectimax planning and optional local Laya review"
+        description="Tetris with LLM or heuristic planning and optional local Laya rating"
     )
     parser.add_argument("--host", default=game_api.DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=game_api.DEFAULT_PORT)
